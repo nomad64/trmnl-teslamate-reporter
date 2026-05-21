@@ -2,8 +2,9 @@ import os
 import logging
 import schedule
 import time
+import threading
 import requests
-import paho.mqtt.subscribe as subscribe
+import paho.mqtt.client as mqtt
 
 # Set up logging
 logging.basicConfig(
@@ -29,37 +30,79 @@ WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 CAR_ID = int(os.environ.get("CAR_ID", "1"))
 
 def fetch_data_mqtt():
-    """Fetch data from MQTT"""
+    """Fetch data from MQTT with a timeout"""
     results = {}
 
-    # Define topics to fetch
-    topics = [
-        f"teslamate/cars/{CAR_ID}/state",
-        f"teslamate/cars/{CAR_ID}/battery_level",
-        f"teslamate/cars/{CAR_ID}/rated_battery_range_km",
-        f"teslamate/cars/{CAR_ID}/version",
-        f"teslamate/cars/{CAR_ID}/odometer",
-        f"teslamate/cars/{CAR_ID}/display_name",
-        f"teslamate/cars/{CAR_ID}/charger_power",
-        f"teslamate/cars/{CAR_ID}/charger_voltage"
-    ]
+    # Define topics and their default values if not received
+    topic_defaults = {
+        "state": "unknown",
+        "battery_level": "0",
+        "rated_battery_range_km": "0",
+        "version": "unknown",
+        "odometer": "0",
+        "display_name": "Tesla",
+        "charger_power": "0",
+        "charger_voltage": "0"
+    }
+    
+    topics = [f"teslamate/cars/{CAR_ID}/{k}" for k in topic_defaults.keys()]
+    finished = threading.Event()
+
+    def on_message(client, userdata, msg):
+        try:
+            if msg.payload:
+                key = msg.topic.split("/")[-1]
+                results[key] = msg.payload.decode().strip()
+                logger.debug(f"Received {key}: {results[key]}")
+            
+            # If we have all topics, we can stop early
+            if len(results) == len(topic_defaults):
+                finished.set()
+        except Exception as e:
+            logger.error(f"Error processing message on {msg.topic}: {e}")
 
     try:
-        # Create a minimal client connection
-        auth = None
+        client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
         if MQTT_USER and MQTT_PASSWORD:
-            auth = {"username": MQTT_USER, "password": MQTT_PASSWORD}
-
-        # Query each topic for the retained message
+            client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+        
+        client.on_message = on_message
+        client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        
         for topic in topics:
-            try:
-                msg = subscribe.simple(topic, hostname=MQTT_BROKER, port=MQTT_PORT, auth=auth, keepalive=1)
-                if msg and msg.payload:
-                    # Try to get the topic name without the prefix
-                    key = topic.split("/")[-1]
-                    results[key] = msg.payload.decode().strip()
-            except Exception as e:
-                logger.error(f"Could not get MQTT topic {topic}: {e}")
+            client.subscribe(topic)
+
+        client.loop_start()
+        
+        # Wait for messages (retained messages usually arrive almost instantly)
+        # We wait up to 3 seconds to be safe
+        finished.wait(timeout=3.0)
+        
+        client.loop_stop()
+        client.disconnect()
+
+        # Fill in defaults for any missing topics
+        if len(results) < len(topic_defaults):
+            for key, default_value in topic_defaults.items():
+                if key not in results:
+                    results[key] = default_value
+                    logger.debug(f"Using default value for {key}: {default_value}")
+            
+            missing = set(topic_defaults.keys()) - set(results.keys())
+            if missing: # Should be empty now, but for safety:
+                logger.warning(f"MQTT fetch timed out. Defaulted: {', '.join(missing)}")
+
+        # Convert km to miles
+        try:
+            if "rated_battery_range_km" in results:
+                km = float(results["rated_battery_range_km"])
+                results["rated_battery_range_mi"] = f"{km * 0.621371:.1f}"
+            
+            if "odometer" in results:
+                km = float(results["odometer"])
+                results["odometer_mi"] = f"{km * 0.621371:.1f}"
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error converting units: {e}")
 
     except Exception as e:
         logger.error(f"Error fetching data from MQTT: {e}")
