@@ -1,6 +1,9 @@
 name: Build and Publish to GHCR
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       tag:
@@ -34,4 +37,6 @@ jobs:
         with:
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/${{ github.repository }}:${{ inputs.tag }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ github.event.inputs.tag || 'latest' }}
+
